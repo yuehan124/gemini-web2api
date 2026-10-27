@@ -202,8 +202,8 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+def generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    """Non-streaming generation returning the raw StreamGenerate response text."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
@@ -222,14 +222,18 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            return resp.read().decode("utf-8", errors="replace")
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
+
+
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    """Non-streaming generation with retry."""
+    return extract_response_text(generate_raw(prompt, model_id, think_mode, file_refs, extra_fields))
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):

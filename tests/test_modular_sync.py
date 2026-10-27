@@ -17,6 +17,15 @@ def _decode_payload(payload):
     return json.loads(outer[1])
 
 
+def _raw_response(text, images=None):
+    """Build a minimal raw StreamGenerate response carrying `text`."""
+    inner = [None, ["c_test", "r_test"], None, None, [["rc_test", [text]]]]
+    if images:
+        inner.append([images])
+    arr = [["wrb.fr", None, json.dumps(inner)]]
+    return json.dumps(arr).ljust(220)
+
+
 def _decode_sse(body):
     events = []
     for block in body.strip().split("\n\n"):
@@ -215,7 +224,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
-    @mock.patch("gemini_web2api.server.generate", return_value="chunked ok")
+    @mock.patch("gemini_web2api.server.generate_raw", return_value=_raw_response("chunked ok"))
     def test_chat_accepts_chunked_body(self, _generate):
         status, _, body = self.post_chunked_json(
             "/v1/chat/completions",
@@ -229,7 +238,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "chunked ok")
 
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
-    @mock.patch("gemini_web2api.server.generate", return_value="looks good")
+    @mock.patch("gemini_web2api.server.generate_raw", return_value=_raw_response("looks good"))
     def test_chat_accepts_openai_image_url_data_url(self, generate, upload_image):
         image_data = base64.b64encode(b"fake png").decode()
 
@@ -260,7 +269,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
     @mock.patch("gemini_web2api.server.fetch_image_bytes", return_value=b"\xff\xd8\xffremote jpeg")
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/remote-ref")
-    @mock.patch("gemini_web2api.server.generate", return_value="remote ok")
+    @mock.patch("gemini_web2api.server.generate_raw", return_value=_raw_response("remote ok"))
     def test_responses_accepts_input_image_url(self, generate, upload_image, fetch_image_bytes):
         status, _, _ = self.post_json(
             "/v1/responses",
@@ -286,7 +295,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertIn("[Image attached]", generate.call_args.args[0])
 
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
-    @mock.patch("gemini_web2api.server.generate", return_value="top-level image ok")
+    @mock.patch("gemini_web2api.server.generate_raw", return_value=_raw_response("top-level image ok"))
     def test_responses_accepts_top_level_input_image(self, generate, upload_image):
         image_data = base64.b64encode(b"fake png").decode()
 
@@ -348,7 +357,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
 
-    @mock.patch("gemini_web2api.server.generate", return_value="hello")
+    @mock.patch("gemini_web2api.server.generate_raw", return_value=_raw_response("hello"))
     def test_responses_text_stream_has_complete_event_sequence(self, _generate):
         status, headers, body = self.post_json(
             "/v1/responses",
@@ -385,7 +394,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1][1]["response"]["output"][0]["content"][0]["text"], "hello")
 
     @mock.patch("gemini_web2api.server.parse_tool_calls")
-    @mock.patch("gemini_web2api.server.generate", return_value="tool output")
+    @mock.patch("gemini_web2api.server.generate_raw", return_value=_raw_response("tool output"))
     def test_responses_function_call_stream_has_complete_event_sequence(
         self, _generate, parse_tool_calls
     ):

@@ -17,17 +17,26 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "sync_token": None,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
+_CONFIG_PATH = None
 
 
 def load_config(path: str = None):
     """Load config from JSON file."""
+    global _CONFIG_PATH
     if path and os.path.exists(path):
         with open(path) as f:
             CONFIG.update(json.load(f))
+        _CONFIG_PATH = os.path.abspath(path)
     return CONFIG
+
+
+def get_config_path():
+    """Absolute path of the config file that was loaded, or None."""
+    return _CONFIG_PATH
 
 
 def find_config():

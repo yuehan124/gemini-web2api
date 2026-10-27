@@ -62,9 +62,11 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "sync_token": None,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
+CONFIG_PATH = None
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
@@ -463,6 +465,18 @@ def extract_response_text(raw: str) -> str:
     return clean_gemini_text(text)
 
 
+def augment_generated_images(text: str, raw: str) -> str:
+    """Attach generated images to a chat reply as markdown image links."""
+    try:
+        from gemini_web2api.images import extract_generated_images, apply_images_to_text
+    except Exception:
+        return text
+    images = extract_generated_images(raw)
+    if not images:
+        return text
+    return apply_images_to_text(text, images)
+
+
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
 PROMPT_MAX_BYTES = 60000
@@ -703,12 +717,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            path = self.path.split("?")[0].rstrip("/")
+            # Session sync from the browser extension. Kept outside the api_keys
+            # check (it is not a model call); it uses sync_token + Origin instead.
+            if path == "/v1/auth/sync":
+                self.handle_auth_sync(self._read_request_body())
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self.handle_chat(body)
+            elif self.path.split("?")[0].rstrip("/") == "/v1/images/generations":
+                self.handle_images(body)
             elif self.path == "/v1/responses":
                 self.handle_responses(body)
             elif ":streamGenerateContent" in self.path:
@@ -765,10 +787,98 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
         raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
         text = extract_response_text(raw)
+        text = augment_generated_images(text, raw)
         tool_calls = None
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
         return text or "", tool_calls
+
+    def handle_images(self, body: bytes):
+        """OpenAI-compatible POST /v1/images/generations."""
+        req = json.loads(body)
+        model_name, model_id, think_mode, err = self._resolve_model(
+            req.get("model", CONFIG["default_model"]))
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
+
+        prompt = req.get("prompt") or ""
+        if not isinstance(prompt, str) or not prompt.strip():
+            self.send_json({"error": {"message": "empty prompt"}}, 400)
+            return
+        response_format = req.get("response_format", "url")
+
+        from gemini_web2api.images import extract_generated_images, download_image
+
+        try:
+            raw = gemini_stream_generate(prompt, model_id, think_mode)
+        except Exception as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
+
+        images = extract_generated_images(raw)
+        if not images:
+            detail = extract_response_text(raw) or "Gemini did not return an image for this prompt"
+            self.send_json({"error": {"message": detail}}, 502)
+            return
+
+        cookie_str, sapisid = load_cookie()
+        proxy = CONFIG.get("proxy")
+        data = []
+        for img in images:
+            item = {"url": img["url"]}
+            if response_format == "b64_json":
+                blob, mime = download_image(img["url"], proxy=proxy,
+                                            cookie=cookie_str, sapisid=sapisid)
+                if blob:
+                    item["b64_json"] = base64.b64encode(blob).decode()
+                    item["mime_type"] = mime
+            data.append(item)
+
+        self.send_json({"created": int(time.time()), "data": data})
+
+    # ─── /v1/auth/sync (browser extension) ────────────────────────────────────
+
+    def handle_auth_sync(self, body: bytes):
+        """Persist a fresh Gemini session pushed by the Chrome extension.
+
+        Writes the cookie file and patches the session-derived values in
+        ``config.json`` so the running server picks them up without a restart.
+        """
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("chrome-extension://"):
+            self.send_json({"error": {"message": "forbidden origin"}}, 403)
+            return
+
+        try:
+            req = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+
+        expected = CONFIG.get("sync_token")
+        if expected:
+            supplied = self.headers.get("X-Sync-Token") or req.get("token") or ""
+            if supplied != expected:
+                self.send_json({"error": {"message": "invalid sync token"}}, 401)
+                return
+
+        from gemini_web2api.authsync import normalize_payload, handle_sync
+        payload, err = normalize_payload(req)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
+
+        auth_path = os.path.abspath(CONFIG.get("cookie_file") or "gemini-auth.json")
+        result, err = handle_sync(payload, auth_path, CONFIG_PATH)
+        if err:
+            self.send_json({"error": {"message": err}}, 500)
+            return
+
+        CONFIG.update(result["updates"])
+        log(f"Auth sync: session saved to {result['auth_file']} "
+            f"(updated: {', '.join(sorted(result['updates']))})")
+        self.send_json(result)
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)
@@ -1047,9 +1157,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def load_config(path: str):
+    global CONFIG_PATH
     if path and os.path.exists(path):
         with open(path) as f:
             CONFIG.update(json.load(f))
+        CONFIG_PATH = os.path.abspath(path)
         log(f"Config loaded: {path}")
 
 

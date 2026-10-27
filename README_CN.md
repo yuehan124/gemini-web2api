@@ -120,7 +120,7 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "你的SAPISID值"}
 ```
 
-**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
+**替代方案 (浏览器扩展)**: 本项目自带 `gemini-cookie-sync-extension` 扩展, 可一键导出 `gemini-auth.json`, 并支持定时自动同步 (见下节).
 
 ### 登录账号路径与 XSRF Token
 
@@ -147,6 +147,56 @@ https://gemini.google.com/u/1/app/...
 
 Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 cookie 可以登录认证, 但会静默回退到 Flash.
 
+## 自动同步 Cookie (Chrome 扩展)
+
+`gemini-cookie-sync-extension` 目录是一个未打包的 Chrome 扩展 (Manifest V3). 它既能手动导出 `gemini-auth.json`, 也能**定时把最新会话推送到正在运行的服务**, 由服务端自动写入 `gemini-auth.json` 并更新 `config.json`.
+
+服务端接口:
+
+```
+POST /v1/auth/sync
+Content-Type: application/json
+X-Sync-Token: <可选, 仅当 config.json 设置了 sync_token 时>
+
+{
+  "cookie": "SAPISID=...; __Secure-1PSID=...",
+  "sapisid": "...",
+  "auth_user": "0",
+  "xsrf_token": "AOOh0P...",
+  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
+}
+```
+
+成功后返回:
+
+```json
+{
+  "ok": true,
+  "auth_file": "D:\\gitcode\\gemini-web2api\\gemini-auth.json",
+  "config_file": "D:\\gitcode\\gemini-web2api\\config.json",
+  "updates": {"cookie_file": "...", "auth_user": "0", "xsrf_token": "...", "gemini_bl": "..."},
+  "saved_at": 1792301287
+}
+```
+
+服务会自动改写 `config.json` 中这些字段: `cookie_file` (指向 `gemini-auth.json` 的绝对路径)、`auth_user`、`xsrf_token`, 以及请求中带上的 `gemini_bl`. 其它字段保持不变, 并且**内存中的配置会立即生效, 无需重启**.
+
+### 安装与使用
+
+1. Chrome 打开 `chrome://extensions`, 开启右上角"开发者模式"
+2. 点击"加载已解压的扩展程序", 选择 `gemini-cookie-sync-extension` 目录
+3. 打开 [gemini.google.com](https://gemini.google.com) 并登录, 刷新页面
+4. 点扩展图标, 在 **Server URL** 填入服务地址 (默认 `http://127.0.0.1:8081`, 需与 `config.json` 的 `port` 一致)
+5. 点 **Sync to server now** 立即同步; 勾选 **Sync automatically in the background** 后可按设定的分钟数定时同步
+6. **Export gemini-auth.json (manual)** 仍保留, 用于不便联网或想手动放置文件的场景
+
+### 安全说明
+
+- 接口不是模型接口, 因此**不受 `api_keys` 限制**; 若要防止本机其它程序写入, 可在 `config.json` 中设置 `sync_token`, 并在扩展里填同样的值 (扩展会以 `X-Sync-Token` 头发送).
+- 服务会拒绝 `Origin` 头存在且不是 `chrome-extension://` 的请求, 以避免恶意网页通过浏览器向本机服务注入 cookie.
+- 定时同步需要有一个已登录的 Gemini 标签页 (或页面抓取成功) 才能拿到最新的 XSRF; 若都拿不到, 同步会失败并提示, cookie 与 XSRF 均不会被写入.
+- 扩展与 `gemini-auth.json` 都包含真实的 Google 会话凭据, 请勿分享或提交到 Git (`gemini-auth.json`、`config.json` 已在 `.gitignore` 中).
+
 ## 配置文件
 
 在同目录创建 `config.json`:
@@ -165,7 +215,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "sync_token": null
 }
 ```
 
@@ -173,6 +224,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 不会将对话保存在账号历史记录中。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+
+`sync_token` 用于保护 Chrome 扩展调用的 `/v1/auth/sync` 接口 (它不校验 `api_keys`). 留空则不校验, 仅依赖 `Origin` 检查.
 
 ## Docker 部署
 
@@ -239,9 +292,48 @@ resp = client.chat.completions.create(
 )
 ```
 
+## 图片生成
+
+Gemini 网页端的图片生成由 **提示词** 触发, 不需要切换模型: 只要 prompt 是生成类指令
+(例如 "生成一张...图片" / "Generate an image of ..."), Gemini 会自动出图。新增 OpenAI
+兼容端点:
+
+```
+POST /v1/images/generations
+```
+
+请求:
+
+```json
+{
+  "model": "gemini-3.6-flash",
+  "prompt": "生成一张红苹果放在木桌上的图片",
+  "response_format": "url"
+}
+```
+
+响应 (OpenAI 格式):
+
+```json
+{
+  "created": 1700000000,
+  "data": [{ "url": "https://lh3.googleusercontent.com/gg-dl/..." }]
+}
+```
+
+- `response_format` 支持 `url` (默认) 与 `b64_json`。
+- Chat Completions / Responses 中如果 Gemini 出图, 回复文本末尾会自动附加
+  `![image](...)` Markdown 链接。
+- 若该提示词触发的是"图片搜索"而非"图片生成", 响应会返回上游说明文本并以 HTTP 502 结束。
+
+> **注意**: 生成图片的 `lh3.googleusercontent.com/gg-dl/...` 链接受 Google 会话保护,
+> 服务端直接下载通常会返回 `403`。`b64_json` 模式下若下载失败会自动回退为返回 `url`;
+> 该 URL 在你的已登录浏览器中可正常打开。
+
 ## 已知限制
 
 - **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
+- **图片生成可能被限流**: Google 可能临时拒绝出图 ("can't create any for you right now"), 此时 `/v1/images/generations` 返回 502。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.

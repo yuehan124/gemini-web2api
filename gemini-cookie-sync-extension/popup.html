@@ -15,6 +15,7 @@
       color: CanvasText;
     }
     h1 { font-size: 17px; margin: 0 0 8px; }
+    h2 { font-size: 13px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
     p { font-size: 13px; line-height: 1.55; margin: 8px 0; }
     button {
       width: 100%;
@@ -26,6 +27,7 @@
       font-size: 14px;
     }
     button:disabled { opacity: .55; cursor: wait; }
+    #sync { background: #17823b; color: white; }
     #export { background: #1769e0; color: white; }
     #inspect, #open { background: color-mix(in srgb, CanvasText 10%, Canvas); color: CanvasText; }
     #status {
@@ -41,17 +43,56 @@
     .warn { color: #b34800; }
     .ok { color: #17823b; }
     code { direction: ltr; unicode-bidi: embed; }
-    .note { opacity: .78; }
+    .note { opacity: .78; font-size: 12px; }
+    .field { display: block; font-size: 12px; margin-top: 10px; }
+    .field span { display: block; margin-bottom: 4px; opacity: .8; }
+    .field input[type="text"], .field input[type="number"], .field input[type="password"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 7px 8px;
+      border-radius: 6px;
+      border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+      background: color-mix(in srgb, CanvasText 4%, Canvas);
+      color: CanvasText;
+      font-size: 13px;
+    }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row .field { flex: 1; }
+    .checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
 <body>
   <h1>Gemini Cookie Sync</h1>
-  <p>Exports cookies, XSRF, and build metadata from the current Gemini session to <code>gemini-auth.json</code>. Nothing is sent over the network.</p>
-  <button id="open" type="button">Open Gemini</button>
+  <p>Reads cookies, XSRF, and build metadata from the current Gemini session. Sync pushes them straight to your running <code>gemini-web2api</code> server, which updates <code>gemini-auth.json</code> and <code>config.json</code>.</p>
+
+  <h2>Server</h2>
+  <label class="field" for="serverUrl">
+    <span>Server URL</span>
+    <input id="serverUrl" type="text" placeholder="http://127.0.0.1:8081" spellcheck="false">
+  </label>
+  <label class="field" for="syncToken">
+    <span>Sync token (only if <code>sync_token</code> is set in config.json)</span>
+    <input id="syncToken" type="password" placeholder="optional" spellcheck="false">
+  </label>
+  <div class="row">
+    <label class="field" for="intervalMinutes">
+      <span>Auto-sync every (minutes)</span>
+      <input id="intervalMinutes" type="number" min="1" step="1" value="25">
+    </label>
+  </div>
+  <label class="checkbox" for="autoSync">
+    <input id="autoSync" type="checkbox">
+    <span>Sync automatically in the background</span>
+  </label>
+
+  <button id="sync" type="button">Sync to server now</button>
   <button id="inspect" type="button">Inspect session</button>
-  <button id="export" type="button">Export gemini-auth.json</button>
+  <button id="open" type="button">Open Gemini</button>
+  <button id="export" type="button">Export gemini-auth.json (manual)</button>
+
   <p id="status">Ready.</p>
-  <p class="note">Open Gemini, sign in, then refresh the page before inspection. The generated file contains highly sensitive session data; do not share it or commit it to Git.</p>
+  <p class="note">Auto-sync needs a signed-in Gemini tab (or the page fetch to succeed) so it can read a fresh XSRF token. The generated file contains highly sensitive session data; do not share it or commit it to Git.</p>
+  <script src="auth.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

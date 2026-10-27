@@ -1,16 +1,18 @@
 """HTTP server: OpenAI-compatible API endpoints."""
 import json
+import os
 import time
 import uuid
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-from .config import CONFIG
+from .config import CONFIG, get_config_path
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate_raw, generate_stream, extract_response_text, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from .images import extract_generated_images, apply_images_to_text, download_image
 from . import __version__
 
 
@@ -18,6 +20,17 @@ def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _generate_with_images(prompt: str, model_id: int, think_mode: int,
+                          file_refs: list = None, extra_fields: dict = None) -> str:
+    """Run a generation and fold any generated images into the reply text."""
+    raw = generate_raw(prompt, model_id, think_mode, file_refs, extra_fields)
+    text = extract_response_text(raw)
+    images = extract_generated_images(raw)
+    if images:
+        text = apply_images_to_text(text, images)
+    return text
 
 
 def _upload_images(images: list) -> list:
@@ -148,12 +161,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            path = self.path.split("?")[0].rstrip("/")
+            # Session sync from the browser extension. Kept outside the api_keys
+            # check (it is not a model call); it uses sync_token + Origin instead.
+            if path == "/v1/auth/sync":
+                self._handle_auth_sync(self._read_request_body())
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self._handle_chat(body)
+            elif self.path.split("?")[0].rstrip("/") == "/v1/images/generations":
+                self._handle_images(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
             elif ":streamGenerateContent" in self.path:
@@ -170,6 +191,48 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
                 pass
+
+    # ─── /v1/auth/sync (browser extension) ────────────────────────────────────
+
+    def _handle_auth_sync(self, body: bytes):
+        """Persist a fresh Gemini session pushed by the Chrome extension.
+
+        Writes the cookie file and patches the session-derived values in
+        ``config.json`` so the running server picks them up without a restart.
+        """
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("chrome-extension://"):
+            self.send_json({"error": {"message": "forbidden origin"}}, 403)
+            return
+
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+
+        expected = CONFIG.get("sync_token")
+        if expected:
+            supplied = self.headers.get("X-Sync-Token") or req.get("token") or ""
+            if supplied != expected:
+                self.send_json({"error": {"message": "invalid sync token"}}, 401)
+                return
+
+        from .authsync import normalize_payload, handle_sync
+        payload, err = normalize_payload(req)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
+
+        auth_path = os.path.abspath(CONFIG.get("cookie_file") or "gemini-auth.json")
+        result, err = handle_sync(payload, auth_path, get_config_path())
+        if err:
+            self.send_json({"error": {"message": err}}, 500)
+            return
+
+        CONFIG.update(result["updates"])
+        log(f"Auth sync: session saved to {result['auth_file']} "
+            f"(updated: {', '.join(sorted(result['updates']))})")
+        self.send_json(result)
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
@@ -232,7 +295,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = _generate_with_images(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -260,6 +323,54 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
                           "total_tokens": (len(prompt)+len(text or ""))//4},
             })
+
+    # ─── /v1/images/generations ──────────────────────────────────────────────
+
+    def _handle_images(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
+            req.get("model", CONFIG["default_model"]))
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
+
+        prompt = req.get("prompt") or ""
+        if not isinstance(prompt, str) or not prompt.strip():
+            self.send_json({"error": {"message": "empty prompt"}}, 400)
+            return
+        response_format = req.get("response_format", "url")
+
+        try:
+            raw = generate_raw(prompt, model_id, think_mode, extra_fields=extra_fields)
+        except Exception as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
+
+        images = extract_generated_images(raw)
+        if not images:
+            detail = extract_response_text(raw) or "Gemini did not return an image for this prompt"
+            self.send_json({"error": {"message": detail}}, 502)
+            return
+
+        from .gemini import load_cookie
+        import base64 as _b64
+        cookie_str, sapisid = load_cookie()
+        proxy = CONFIG.get("proxy")
+        data = []
+        for img in images:
+            item = {"url": img["url"]}
+            if response_format == "b64_json":
+                blob, mime = download_image(img["url"], proxy=proxy,
+                                            cookie=cookie_str, sapisid=sapisid)
+                if blob:
+                    item["b64_json"] = _b64.b64encode(blob).decode()
+                    item["mime_type"] = mime
+            data.append(item)
+
+        self.send_json({"created": int(time.time()), "data": data})
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
@@ -325,7 +436,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = _generate_with_images(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -546,7 +657,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = _generate_with_images(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
