@@ -4,9 +4,27 @@
 importScripts("auth.js");
 
 const ALARM_NAME = "gemini-cookie-sync";
+const SETTINGS_VERSION = 1;
+
+async function migrateSettings() {
+  const stored = await chrome.storage.local.get({ settingsVersion: 0, intervalMinutes: null });
+  if (stored.settingsVersion >= SETTINGS_VERSION) return;
+  // 旧版本默认 25 分钟，且 worker 唤醒会重建 1 分钟延迟的 alarm；升级时统一回到 5 分钟。
+  await chrome.storage.local.set({
+    settingsVersion: SETTINGS_VERSION,
+    intervalMinutes: DEFAULT_SETTINGS.intervalMinutes
+  });
+}
+
+async function ensureAlarm() {
+  // worker 每次唤醒都执行：只在 alarm 不存在时创建，避免把周期重置成 1 分钟。
+  const existing = await chrome.alarms.get(ALARM_NAME);
+  if (!existing) await scheduleAlarm();
+}
 
 async function scheduleAlarm() {
   await chrome.alarms.clear(ALARM_NAME);
+  await migrateSettings();
 
   const settings = await getSettings();
   if (!settings.autoSync) return;
@@ -83,4 +101,4 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 // Make sure an alarm exists after the worker wakes for any reason.
-scheduleAlarm();
+ensureAlarm();

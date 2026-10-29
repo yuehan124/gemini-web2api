@@ -7,3 +7,5 @@ cookie.json
 .idea
 .DS_Store
 gemini-auth.json
+downloads/
+logs/

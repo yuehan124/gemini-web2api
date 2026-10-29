@@ -26,7 +26,7 @@ async function loadSettingsIntoForm() {
   const settings = await getSettings();
   serverUrlInput.value = settings.serverUrl || "";
   syncTokenInput.value = settings.syncToken || "";
-  intervalInput.value = settings.intervalMinutes || 25;
+  intervalInput.value = settings.intervalMinutes || 5;
   autoSyncInput.checked = Boolean(settings.autoSync);
 }
 

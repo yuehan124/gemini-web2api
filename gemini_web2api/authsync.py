@@ -17,24 +17,6 @@ import time
 # At least one of these must be present for the session to be usable.
 SESSION_COOKIES = ("__Secure-1PSID", "__Secure-3PSID", "SID")
 
-# Google rotates these companion cookies on any background Google activity, so
-# their values change on nearly every extension push even when the session
-# itself is unchanged. They are never used to authenticate (the API relies on
-# SAPISID for the SAPISIDHASH and the stable session cookie), so we ignore them
-# when deciding whether a sync actually changed the session.
-VOLATILE_COOKIES = frozenset((
-    "__Secure-1PSIDTS",
-    "__Secure-3PSIDTS",
-    "__Secure-1PSIDCC",
-    "__Secure-3PSIDCC",
-    "__Secure-1PSIDRTS",
-    "__Secure-3PSIDRTS",
-    "AEC",
-    "NID",
-    "SIDCC",
-    "COMPASS",
-))
-
 
 def parse_cookie(cookie):
     """Parse a Cookie header into a {name: value} dict (first wins)."""
@@ -48,21 +30,6 @@ def parse_cookie(cookie):
         if name and name not in pairs:
             pairs[name] = value
     return pairs
-
-
-def stable_cookie(cookie):
-    """Drop volatile rotating cookies and return the remaining cookie string.
-
-    Only cookies that matter for authentication are kept, so the persisted
-    session stays byte-stable across background syncs and does not carry
-    short-lived Google housekeeping cookies into the file.
-    """
-    pairs = parse_cookie(cookie)
-    return "; ".join(
-        f"{name}={value}"
-        for name, value in pairs.items()
-        if name not in VOLATILE_COOKIES
-    )
 
 
 def normalize_payload(raw):
@@ -156,8 +123,8 @@ def handle_sync(payload, auth_path, config_path):
     """Persist the session to ``auth_path`` and patch ``config_path``.
 
     Returns ``(result, error)``. ``result['updates']`` lists the config keys the
-    caller should apply to its in-memory CONFIG. Files whose content would not
-    change are left untouched and ``result['changed']`` is ``False``.
+    caller should apply to its in-memory CONFIG. 落盘与变更判定都按全量内容比较
+    （含轮转 token），会话因此始终是最新的。
     """
     updates = {
         "cookie_file": os.path.abspath(auth_path),
@@ -168,16 +135,17 @@ def handle_sync(payload, auth_path, config_path):
         updates["gemini_bl"] = payload["gemini_bl"]
 
     session = {
-        "cookie": stable_cookie(payload["cookie"]),
+        "cookie": payload["cookie"],
         "sapisid": payload["sapisid"],
         "auth_user": payload["auth_user"],
         "xsrf_token": payload["xsrf_token"],
         "gemini_bl": payload["gemini_bl"],
     }
-    # Volatile rotating cookies are stripped above, so the stored cookie only
-    # changes when the real session does; a re-push of the same session leaves
-    # the file (and its mtime) untouched.
-    auth_changed = load_json(auth_path) != session
+    # 落盘保留完整 cookie（含 PSIDTS/SIDCC/AEC 等轮转 token）：Google 的图像能力会
+    # 校验这些 token 的新鲜度，曾因删减它们导致"能聊天、不能出图"。
+    # 变更判定按全量内容比较：轮转 token 变化也写盘并记录，保证会话始终是最新的。
+    current = load_json(auth_path)
+    auth_changed = current != session
     if auth_changed:
         atomic_write_json(auth_path, session)
 

@@ -33,6 +33,7 @@ import hashlib
 import argparse
 import base64
 import binascii
+import threading
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -67,6 +68,58 @@ DEFAULT_CONFIG = {
 
 CONFIG = dict(DEFAULT_CONFIG)
 CONFIG_PATH = None
+
+# 生成图片的本地托管：调用方（OpenAI Images 兼容协议）不能直连 Google CDN（需 VPN），
+# 由本服务代为下载并按 /images-files/<token>.png 提供访问。
+IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+SERVED_IMAGES_PREFIX = "/images-files/"
+# 刚生成的图片在 Google CDN 上可能暂时返回 403（实测需要数分钟才可匿名下载），
+# 因此下载与响应解耦：POST 先返回本地 URL，后台线程按分钟级节奏补齐文件。
+IMAGE_FILLS = {}
+IMAGE_FILLS_LOCK = threading.Lock()
+
+
+def image_name(url: str) -> str:
+    return hashlib.sha1(url.encode()).hexdigest()[:24] + ".png"
+
+
+def write_image(name: str, blob: bytes) -> None:
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    path = os.path.join(IMAGES_DIR, name)
+    temporary = path + ".tmp"
+    with open(temporary, "wb") as f:
+        f.write(blob)
+    os.replace(temporary, path)
+
+
+def schedule_image_fill(name: str, url: str, cookie: str, sapisid, proxy) -> None:
+    """后台补齐本地图片文件；同一 URL 只跑一个任务，失败按分钟级节奏重试。"""
+    with IMAGE_FILLS_LOCK:
+        if name in IMAGE_FILLS:
+            return
+        IMAGE_FILLS[name] = time.time()
+
+    def worker():
+        from gemini_web2api.images import download_image, to_png
+
+        try:
+            blob, mime = download_image(
+                url, proxy=proxy, cookie=cookie, sapisid=sapisid,
+                attempts=15, retry_delay=25, max_seconds=900,
+            )
+            if blob:
+                blob, _mime = to_png(blob, mime)
+                write_image(name, blob)
+                log(f"Image fill completed: {name} ({len(blob)} bytes)")
+            else:
+                log(f"Image fill gave up: {name}")
+        except Exception as error:  # 后台线程不能抛出，否则丢失任务状态
+            log(f"Image fill error: {name}: {error}")
+        finally:
+            with IMAGE_FILLS_LOCK:
+                IMAGE_FILLS.pop(name, None)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
@@ -699,6 +752,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            # 本地托管的生成图片；带图片签名 token，不放在 /v1 下以绕过 API key 门槛
+            # （OpenAI Images 兼容方下载 url 时不携带密钥）。
+            if self.path.startswith(SERVED_IMAGES_PREFIX):
+                self.handle_image_file()
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -719,6 +777,40 @@ class GeminiHandler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             log(f"GET error: {e}")
+
+    def handle_image_file(self):
+        """Serve a locally-hosted generated image; content-addressed token, no auth."""
+        name = self.path.split("?")[0][len(SERVED_IMAGES_PREFIX):]
+        if "/" in name or "\\" in name or not name.endswith(".png"):
+            self.send_json({"error": {"message": "not found"}}, 404)
+            return
+        path = os.path.join(IMAGES_DIR, name)
+        if not os.path.isfile(path):
+            # 后台补齐尚未完成：用 Retry-After 告知调用方稍后重试。
+            with IMAGE_FILLS_LOCK:
+                pending = name in IMAGE_FILLS
+            if pending:
+                payload = b"image is being fetched, retry shortly"
+                self.send_response(503)
+                self.send_header("Retry-After", "15")
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                self.send_json({"error": {"message": "not found"}}, 404)
+            return
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(blob)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self):
         try:
@@ -917,15 +1009,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         cookie_str, sapisid = load_cookie()
         proxy = CONFIG.get("proxy")
+        from gemini_web2api.images import download_image, to_png
+        # OpenAI Images 兼容约定：返回调用方可直接 GET 的 url；Google CDN 需要 VPN，
+        # 由本服务代为下载并转成 PNG 后本地托管（不留原始 base64 转码负担给调用方）。
+        host = self.headers.get("Host") or f"127.0.0.1:{CONFIG.get('port') or 8081}"
+        base = f"http://{host}"
         data = []
         for img in images:
-            item = {"url": img["url"]}
-            if response_format == "b64_json":
-                blob, mime = download_image(img["url"], proxy=proxy,
-                                            cookie=cookie_str, sapisid=sapisid)
+            name = image_name(img["url"])
+            path = os.path.join(IMAGES_DIR, name)
+            blob = None
+            if os.path.isfile(path):
+                try:
+                    with open(path, "rb") as f:
+                        blob = f.read()
+                except OSError:
+                    blob = None
+            if blob is None:
+                # 新鲜链接经常暂时 403：只在响应前做一次短尝试，失败转后台补齐。
+                blob, mime = download_image(
+                    img["url"], proxy=proxy, cookie=cookie_str, sapisid=sapisid,
+                    attempts=2, max_seconds=20,
+                )
                 if blob:
-                    item["b64_json"] = base64.b64encode(blob).decode()
-                    item["mime_type"] = mime
+                    blob, _mime = to_png(blob, mime)
+                    write_image(name, blob)
+                else:
+                    schedule_image_fill(name, img["url"], cookie_str, sapisid, proxy)
+            item = {"url": base + SERVED_IMAGES_PREFIX + name, "mime_type": "image/png"}
+            if response_format == "b64_json" and blob:
+                item["b64_json"] = base64.b64encode(blob).decode()
             data.append(item)
 
         result = {"created": int(time.time()), "data": data}

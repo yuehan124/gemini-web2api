@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Cookie Sync",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Exports Gemini cookies plus XSRF/build metadata for gemini-web2api and can sync them to the local server automatically.",
   "permissions": [
     "cookies",

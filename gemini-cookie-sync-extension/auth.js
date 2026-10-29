@@ -40,11 +40,18 @@ const LOOKUP_URLS = [
   "https://google.com/"
 ];
 
+// chrome.cookies.getAll({storeId}) 在部分版本不会返回全部 cookie（实测 legacy
+// SID/HSID/APISID 会漏），因此按域名与按名字再各查一轮补齐。
+const LOOKUP_DOMAINS = ["google.com", "gemini.google.com", "accounts.google.com", "www.google.com"];
+const NAMED_LOOKUP_URLS = ["https://gemini.google.com/app", "https://accounts.google.com/"];
+
 const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:8081",
   syncToken: "",
   autoSync: true,
-  intervalMinutes: 25
+  // 5 分钟：Google 的轮转 token（PSIDTS 等）活跃时会快速失效，间隔过长会导致
+  // 服务端持有陈旧会话，图像生成被上游拒绝。
+  intervalMinutes: 5
 };
 
 const SYNC_PATH = "/v1/auth/sync";
@@ -115,15 +122,21 @@ async function readGoogleCookies() {
   for (const store of stores) {
     const queries = [
       chrome.cookies.getAll({ storeId: store.id }),
-      ...LOOKUP_URLS.map((url) => chrome.cookies.getAll({ storeId: store.id, url }))
+      ...LOOKUP_URLS.map((url) => chrome.cookies.getAll({ storeId: store.id, url })),
+      ...LOOKUP_DOMAINS.map((domain) => chrome.cookies.getAll({ storeId: store.id, domain })),
+      ...EXPORT_ORDER.flatMap((name) =>
+        NAMED_LOOKUP_URLS.map((url) => chrome.cookies.get({ storeId: store.id, url, name }))
+      )
     ];
 
     const results = await Promise.allSettled(queries);
 
     for (const result of results) {
       if (result.status !== "fulfilled") continue;
-      for (const cookie of result.value) {
-        if (!isGoogleCookie(cookie) || !cookie.value) continue;
+      // chrome.cookies.get 返回单个 cookie，getAll 返回数组，统一处理。
+      const found = Array.isArray(result.value) ? result.value : [result.value];
+      for (const cookie of found) {
+        if (!cookie || !isGoogleCookie(cookie) || !cookie.value) continue;
         deduped.set(cookieKey(cookie), cookie);
       }
     }
