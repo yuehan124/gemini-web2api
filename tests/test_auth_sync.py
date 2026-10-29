@@ -153,6 +153,60 @@ class HandleSyncTests(unittest.TestCase):
         self.assertTrue(os.path.exists(self.auth_path))
         self.assertIsNone(result["config_file"])
 
+    def test_unchanged_session_leaves_files_untouched(self):
+        payload = self._payload()
+        result, err = authsync.handle_sync(payload, self.auth_path, self.config_path)
+        self.assertIsNone(err)
+        self.assertTrue(result["changed"])
+
+        auth_mtime = os.stat(self.auth_path).st_mtime_ns
+        config_mtime = os.stat(self.config_path).st_mtime_ns
+
+        result, err = authsync.handle_sync(payload, self.auth_path, self.config_path)
+        self.assertIsNone(err)
+        self.assertFalse(result["changed"])
+        self.assertEqual(os.stat(self.auth_path).st_mtime_ns, auth_mtime)
+        self.assertEqual(os.stat(self.config_path).st_mtime_ns, config_mtime)
+
+    def test_volatile_cookies_are_not_persisted(self):
+        payload = self._payload()
+        payload["cookie"] = (
+            "SAPISID=abcd; __Secure-1PSID=xyz; __Secure-1PSIDTS=rot1; AEC=rot2; NID=rot3"
+        )
+        result, err = authsync.handle_sync(payload, self.auth_path, self.config_path)
+        self.assertIsNone(err)
+        with open(self.auth_path, encoding="utf-8") as handle:
+            saved = json.load(handle)["cookie"]
+        self.assertNotIn("__Secure-1PSIDTS", saved)
+        self.assertNotIn("AEC", saved)
+        self.assertNotIn("NID", saved)
+        self.assertIn("SAPISID=abcd", saved)
+        self.assertIn("__Secure-1PSID=xyz", saved)
+
+    def test_rotating_cookie_changes_do_not_rewrite_auth_file(self):
+        payload = self._payload()
+        payload["cookie"] = "SAPISID=abcd; __Secure-1PSID=xyz; __Secure-1PSIDTS=v1"
+        authsync.handle_sync(payload, self.auth_path, self.config_path)
+        auth_mtime = os.stat(self.auth_path).st_mtime_ns
+
+        # Same session, only a volatile rotating cookie changed.
+        payload["cookie"] = "SAPISID=abcd; __Secure-1PSID=xyz; __Secure-1PSIDTS=v2"
+        result, err = authsync.handle_sync(payload, self.auth_path, self.config_path)
+        self.assertIsNone(err)
+        self.assertFalse(result["changed"])
+        self.assertEqual(os.stat(self.auth_path).st_mtime_ns, auth_mtime)
+
+    def test_changed_cookie_rewrites_auth_file(self):
+        authsync.handle_sync(self._payload(), self.auth_path, self.config_path)
+
+        payload = self._payload()
+        payload["cookie"] = "SAPISID=new; __Secure-1PSID=xyz"
+        result, err = authsync.handle_sync(payload, self.auth_path, self.config_path)
+        self.assertIsNone(err)
+        self.assertTrue(result["changed"])
+        with open(self.auth_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["cookie"], payload["cookie"])
+
 
 class AuthSyncEndpointTests(unittest.TestCase):
     @classmethod

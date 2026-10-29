@@ -1,17 +1,20 @@
 """HTTP server: OpenAI-compatible API endpoints."""
 import json
 import os
+import hashlib
 import time
 import uuid
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs
 
 from .config import CONFIG, get_config_path
 from .models import MODELS, resolve_model
 from .gemini import generate_raw, generate_stream, extract_response_text, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from .image_sessions import IMAGE_CONVERSATIONS
 from .images import extract_generated_images, apply_images_to_text, download_image
 from . import __version__
 
@@ -230,8 +233,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         CONFIG.update(result["updates"])
-        log(f"Auth sync: session saved to {result['auth_file']} "
-            f"(updated: {', '.join(sorted(result['updates']))})")
+        if result["changed"]:
+            log(f"Auth sync: session saved to {result['auth_file']} "
+                f"(updated: {', '.join(sorted(result['updates']))})")
+        else:
+            log("Auth sync: session unchanged, files left untouched")
         self.send_json(result)
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
@@ -326,6 +332,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     # ─── /v1/images/generations ──────────────────────────────────────────────
 
+    def _image_session_key(self, session_id):
+        credential = self.headers.get("Authorization", "")
+        if credential.startswith("Bearer "):
+            credential = credential[7:]
+        else:
+            credential = self.headers.get("x-api-key") or self.headers.get("x-goog-api-key") or ""
+        if not credential and "?" in self.path:
+            credential = parse_qs(self.path.split("?", 1)[1]).get("key", [""])[0]
+        owner = hashlib.sha256(credential.encode()).hexdigest() if credential else "anonymous"
+        return owner, session_id
+
     def _handle_images(self, body: bytes):
         req = self._parse_body(body)
         if req is None:
@@ -337,6 +354,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
+        session_id = req.get("session_id")
+        if session_id is not None and (
+            not isinstance(session_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id)
+        ):
+            self.send_json({"error": {"message": "invalid session_id"}}, 400)
+            return
+
         prompt = req.get("prompt") or ""
         if not isinstance(prompt, str) or not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
@@ -344,12 +369,40 @@ class GeminiHandler(BaseHTTPRequestHandler):
         response_format = req.get("response_format", "url")
 
         try:
-            raw = generate_raw(prompt, model_id, think_mode, extra_fields=extra_fields)
+            if session_id:
+                with IMAGE_CONVERSATIONS.use(self._image_session_key(session_id)) as session:
+                    try:
+                        raw = generate_raw(
+                            prompt,
+                            model_id,
+                            think_mode,
+                            extra_fields=extra_fields,
+                            chat_context=session["context"],
+                        )
+                        images = extract_generated_images(raw)
+                        if images:
+                            first = images[0]
+                            context = {name: first.get(name) for name in ("cid", "rid", "rcid")}
+                            if not context["cid"] or not context["rid"]:
+                                session["context"] = None
+                                self.send_json(
+                                    {"error": {"message": "Gemini did not return conversation identifiers"}},
+                                    502,
+                                )
+                                return
+                            session["context"] = context
+                        else:
+                            session["context"] = None
+                    except Exception:
+                        session["context"] = None
+                        raise
+            else:
+                raw = generate_raw(prompt, model_id, think_mode, extra_fields=extra_fields)
+                images = extract_generated_images(raw)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        images = extract_generated_images(raw)
         if not images:
             detail = extract_response_text(raw) or "Gemini did not return an image for this prompt"
             self.send_json({"error": {"message": detail}}, 502)
@@ -370,7 +423,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     item["mime_type"] = mime
             data.append(item)
 
-        self.send_json({"created": int(time.time()), "data": data})
+        result = {"created": int(time.time()), "data": data}
+        if session_id:
+            result["session_id"] = session_id
+        self.send_json(result)
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 

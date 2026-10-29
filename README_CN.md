@@ -308,6 +308,7 @@ POST /v1/images/generations
 {
   "model": "gemini-3.6-flash",
   "prompt": "生成一张红苹果放在木桌上的图片",
+  "session_id": "video-job-42",
   "response_format": "url"
 }
 ```
@@ -322,6 +323,7 @@ POST /v1/images/generations
 ```
 
 - `response_format` 支持 `url` (默认) 与 `b64_json`。
+- `session_id` 可选。连续生成一组图片时，每次请求使用同一个 ID，服务端会将 Gemini 上一轮会话接续到下一幅；不同生成批次使用不同 ID。相同 ID 的请求会串行处理。会话状态保存在当前服务进程内，闲置 1 小时或服务重启后失效；不传 ID 时保持原先的独立请求行为。
 - Chat Completions / Responses 中如果 Gemini 出图, 回复文本末尾会自动附加
   `![image](...)` Markdown 链接。
 - 若该提示词触发的是"图片搜索"而非"图片生成", 响应会返回上游说明文本并以 HTTP 502 结束。
@@ -335,7 +337,7 @@ POST /v1/images/generations
 - **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
 - **图片生成可能被限流**: Google 可能临时拒绝出图 ("can't create any for you right now"), 此时 `/v1/images/generations` 返回 502。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
-- **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
+- **单轮对话**: Chat Completions 每次请求仍是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟。图片生成接口可通过复用 `session_id` 接续同一组图像生成会话.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
 
 ## 系统要求

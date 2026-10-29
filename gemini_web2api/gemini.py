@@ -114,7 +114,8 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                   extra_fields: dict = None, chat_context: dict = None) -> str:
     inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
@@ -140,6 +141,13 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
+    if chat_context:
+        # The StreamGenerate chat metadata carries the previous turn identifiers.
+        inner[2] = [
+            chat_context.get("cid"),
+            chat_context.get("rid"),
+            chat_context.get("rcid"),
+        ]
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -202,9 +210,10 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                 extra_fields: dict = None, chat_context: dict = None) -> str:
     """Non-streaming generation returning the raw StreamGenerate response text."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, chat_context).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()

@@ -876,8 +876,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         CONFIG.update(result["updates"])
-        log(f"Auth sync: session saved to {result['auth_file']} "
-            f"(updated: {', '.join(sorted(result['updates']))})")
+        if result["changed"]:
+            log(f"Auth sync: session saved to {result['auth_file']} "
+                f"(updated: {', '.join(sorted(result['updates']))})")
+        else:
+            log("Auth sync: session unchanged, files left untouched")
         self.send_json(result)
 
     def handle_chat(self, body: bytes):
