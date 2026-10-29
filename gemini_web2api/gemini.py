@@ -142,12 +142,10 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
         for k, v in extra_fields.items():
             inner[k] = v
     if chat_context:
-        # The StreamGenerate chat metadata carries the previous turn identifiers.
-        inner[2] = [
-            chat_context.get("cid"),
-            chat_context.get("rid"),
-            chat_context.get("rcid"),
-        ]
+        # Gemini Web continues a conversation with chat metadata [cid, rid].
+        # rcid is only the chosen reply candidate and must not be sent here.
+        metadata = [chat_context.get("cid"), chat_context.get("rid")]
+        inner[2] = [value for value in metadata if value]
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):

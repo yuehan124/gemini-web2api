@@ -14,8 +14,8 @@ from .models import MODELS, resolve_model
 from .gemini import generate_raw, generate_stream, extract_response_text, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
-from .image_sessions import IMAGE_CONVERSATIONS
-from .images import extract_generated_images, apply_images_to_text, download_image
+from .image_sessions import IMAGE_CONVERSATIONS, is_session_id
+from .images import extract_generated_images, apply_images_to_text, conversation_context, download_image
 from . import __version__
 
 
@@ -355,12 +355,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         session_id = req.get("session_id")
-        if session_id is not None and (
-            not isinstance(session_id, str)
-            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id)
-        ):
-            self.send_json({"error": {"message": "invalid session_id"}}, 400)
-            return
+        if session_id is not None:
+            if not is_session_id(session_id):
+                self.send_json(
+                    {"error": {"message": "invalid session_id (expected Gemini conversation id like c_...)"}},
+                    400,
+                )
+                return
+            session_id = session_id.lower()
 
         prompt = req.get("prompt") or ""
         if not isinstance(prompt, str) or not prompt.strip():
@@ -368,37 +370,59 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         response_format = req.get("response_format", "url")
 
+        raw = None
+        images = []
         try:
             if session_id:
-                with IMAGE_CONVERSATIONS.use(self._image_session_key(session_id)) as session:
-                    try:
-                        raw = generate_raw(
-                            prompt,
-                            model_id,
-                            think_mode,
-                            extra_fields=extra_fields,
-                            chat_context=session["context"],
+                with IMAGE_CONVERSATIONS.use(
+                    self._image_session_key(session_id), create=False
+                ) as session:
+                    if session is None:
+                        self.send_json({"error": {"message": "unknown or expired session_id"}}, 404)
+                        return
+                    if not session.get("context"):
+                        self.send_json(
+                            {"error": {"message": "session context unavailable; start a new session"}},
+                            409,
                         )
-                        images = extract_generated_images(raw)
-                        if images:
-                            first = images[0]
-                            context = {name: first.get(name) for name in ("cid", "rid", "rcid")}
-                            if not context["cid"] or not context["rid"]:
-                                session["context"] = None
-                                self.send_json(
-                                    {"error": {"message": "Gemini did not return conversation identifiers"}},
-                                    502,
-                                )
-                                return
-                            session["context"] = context
-                        else:
-                            session["context"] = None
-                    except Exception:
-                        session["context"] = None
-                        raise
+                        return
+                    raw = generate_raw(
+                        prompt,
+                        model_id,
+                        think_mode,
+                        extra_fields=extra_fields,
+                        chat_context=session["context"],
+                    )
+                    images = extract_generated_images(raw)
+                    if images:
+                        context = conversation_context(images)
+                        if not context:
+                            self.send_json(
+                                {"error": {"message": "Gemini did not return conversation identifiers"}},
+                                502,
+                            )
+                            return
+                        if context["cid"].lower() != session_id:
+                            self.send_json(
+                                {"error": {"message": "Gemini started a new conversation; retry without session_id"}},
+                                502,
+                            )
+                            return
+                        session["context"] = context
             else:
                 raw = generate_raw(prompt, model_id, think_mode, extra_fields=extra_fields)
                 images = extract_generated_images(raw)
+                if images:
+                    context = conversation_context(images)
+                    if not context:
+                        self.send_json(
+                            {"error": {"message": "Gemini did not return conversation identifiers"}},
+                            502,
+                        )
+                        return
+                    session_id = context["cid"].lower()
+                    with IMAGE_CONVERSATIONS.use(self._image_session_key(session_id)) as session:
+                        session["context"] = context
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

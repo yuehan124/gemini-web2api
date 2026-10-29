@@ -222,7 +222,8 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                           chat_context: dict = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
     if file_refs:
@@ -232,6 +233,10 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    if chat_context:
+        # Gemini Web continues a conversation with chat metadata [cid, rid].
+        metadata = [chat_context.get("cid"), chat_context.get("rid")]
+        inner[2] = [value for value in metadata if value]
     inner[6] = [0]
     inner[7] = 1
     inner[10] = 1
@@ -774,6 +779,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
+    def _parse_json_body(self, body: bytes):
+        """Parse a JSON request body, returning ``(data, error_message)``."""
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None, "invalid JSON"
+        if not isinstance(data, dict):
+            return None, "invalid JSON"
+        return data, None
+
     def _resolve_model(self, model_name):
         think_override = None
         if "@think=" in model_name:
@@ -793,14 +808,41 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text, tool_calls = parse_tool_calls(text)
         return text or "", tool_calls
 
+    def _image_session_key(self, session_id):
+        credential = self.headers.get("Authorization", "")
+        if credential.startswith("Bearer "):
+            credential = credential[7:]
+        else:
+            credential = self.headers.get("x-api-key") or self.headers.get("x-goog-api-key") or ""
+        if not credential and "?" in self.path:
+            credential = urllib.parse.parse_qs(
+                self.path.split("?", 1)[1]
+            ).get("key", [""])[0]
+        owner = hashlib.sha256(credential.encode()).hexdigest() if credential else "anonymous"
+        return owner, session_id
+
     def handle_images(self, body: bytes):
         """OpenAI-compatible POST /v1/images/generations."""
-        req = json.loads(body)
+        req, err = self._parse_json_body(body)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
+
+        session_id = req.get("session_id")
+        from gemini_web2api.image_sessions import IMAGE_CONVERSATIONS, is_session_id
+        if session_id is not None:
+            if not is_session_id(session_id):
+                self.send_json(
+                    {"error": {"message": "invalid session_id (expected Gemini conversation id like c_...)"}},
+                    400,
+                )
+                return
+            session_id = session_id.lower()
 
         prompt = req.get("prompt") or ""
         if not isinstance(prompt, str) or not prompt.strip():
@@ -808,15 +850,66 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         response_format = req.get("response_format", "url")
 
-        from gemini_web2api.images import extract_generated_images, download_image
+        from gemini_web2api.images import (
+            conversation_context,
+            download_image,
+            extract_generated_images,
+        )
 
+        raw = None
+        images = []
         try:
-            raw = gemini_stream_generate(prompt, model_id, think_mode)
+            if session_id:
+                with IMAGE_CONVERSATIONS.use(
+                    self._image_session_key(session_id), create=False
+                ) as session:
+                    if session is None:
+                        self.send_json({"error": {"message": "unknown or expired session_id"}}, 404)
+                        return
+                    if not session.get("context"):
+                        self.send_json(
+                            {"error": {"message": "session context unavailable; start a new session"}},
+                            409,
+                        )
+                        return
+                    raw = gemini_stream_generate(
+                        prompt, model_id, think_mode,
+                        chat_context=session["context"],
+                    )
+                    images = extract_generated_images(raw)
+                    if images:
+                        context = conversation_context(images)
+                        if not context:
+                            self.send_json(
+                                {"error": {"message": "Gemini did not return conversation identifiers"}},
+                                502,
+                            )
+                            return
+                        if context["cid"].lower() != session_id:
+                            self.send_json(
+                                {"error": {"message": "Gemini started a new conversation; retry without session_id"}},
+                                502,
+                            )
+                            return
+                        session["context"] = context
+            else:
+                raw = gemini_stream_generate(prompt, model_id, think_mode)
+                images = extract_generated_images(raw)
+                if images:
+                    context = conversation_context(images)
+                    if not context:
+                        self.send_json(
+                            {"error": {"message": "Gemini did not return conversation identifiers"}},
+                            502,
+                        )
+                        return
+                    session_id = context["cid"].lower()
+                    with IMAGE_CONVERSATIONS.use(self._image_session_key(session_id)) as session:
+                        session["context"] = context
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        images = extract_generated_images(raw)
         if not images:
             detail = extract_response_text(raw) or "Gemini did not return an image for this prompt"
             self.send_json({"error": {"message": detail}}, 502)
@@ -835,7 +928,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     item["mime_type"] = mime
             data.append(item)
 
-        self.send_json({"created": int(time.time()), "data": data})
+        result = {"created": int(time.time()), "data": data}
+        if session_id:
+            result["session_id"] = session_id
+        self.send_json(result)
 
     # ─── /v1/auth/sync (browser extension) ────────────────────────────────────
 
@@ -884,7 +980,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_json(result)
 
     def handle_chat(self, body: bytes):
-        req = json.loads(body)
+        req, err = self._parse_json_body(body)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -968,7 +1067,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
-        req = json.loads(body)
+        req, err = self._parse_json_body(body)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -1106,7 +1208,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _handle_google_generate(self, body: bytes, stream: bool):
         """Handle Google native generateContent / streamGenerateContent."""
-        req = json.loads(body)
+        req, err = self._parse_json_body(body)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
         model_name = self._parse_google_model_from_path()
         if not model_name:
             self.send_json({"error": {"message": "model not specified in path"}}, 400)

@@ -1,9 +1,17 @@
 """In-memory continuation state for explicitly grouped image generations."""
 
+import re
 import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
+
+# Gemini Web conversation IDs look like ``c_8535b932daf1eb4f``.
+SESSION_ID_PATTERN = re.compile(r"c_[0-9a-f]{16}", re.IGNORECASE)
+
+
+def is_session_id(value):
+    return isinstance(value, str) and SESSION_ID_PATTERN.fullmatch(value) is not None
 
 
 class ImageConversationSessions:
@@ -31,12 +39,15 @@ class ImageConversationSessions:
             self._entries.pop(removable, None)
 
     @contextmanager
-    def use(self, key):
+    def use(self, key, create=True):
         now = time.monotonic()
         with self._guard:
             self._prune(now)
             entry = self._entries.get(key)
             if entry is None:
+                if not create:
+                    yield None
+                    return
                 entry = {"context": None, "updated": now, "active": 0, "lock": threading.Lock()}
                 self._entries[key] = entry
             entry["active"] += 1

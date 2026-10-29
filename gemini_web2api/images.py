@@ -142,6 +142,16 @@ def apply_images_to_text(text: str, images: list) -> str:
     return links
 
 
+def conversation_context(images: list):
+    """Return the Gemini Web continuation metadata for a generated image reply."""
+    for image in images or []:
+        cid = image.get("cid")
+        rid = image.get("rid")
+        if cid and rid:
+            return {"cid": cid, "rid": rid}
+    return None
+
+
 # ─── Download (best effort) ──────────────────────────────────────────────────
 
 def _sapisidhash(sapisid: str) -> str:

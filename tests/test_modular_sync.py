@@ -79,10 +79,12 @@ class PayloadPersistenceTests(unittest.TestCase):
     def test_payload_includes_previous_chat_context(self):
         inner = _decode_payload(_build_payload(
             "next image", 1, 4,
-            chat_context={"cid": "conversation-1", "rid": "response-1", "rcid": "choice-1"},
+            chat_context={"cid": "c_0123456789abcdef", "rid": "r_fedcba9876543210",
+                          "rcid": "rc_0123456789abcdef"},
         ))
 
-        self.assertEqual(inner[2], ["conversation-1", "response-1", "choice-1"])
+        # Gemini Web continues with [cid, rid]; rcid is not part of chat metadata.
+        self.assertEqual(inner[2], ["c_0123456789abcdef", "r_fedcba9876543210"])
 
 
 class MessageParsingTests(unittest.TestCase):
@@ -207,38 +209,55 @@ class StreamingEndpointTests(unittest.TestCase):
         connection.close()
         return response.status, headers, body
 
-    def test_image_generation_reuses_session_context_only_for_matching_session_id(self):
+    def test_image_generation_uses_gemini_conversation_id_and_reuses_context(self):
+        cid = "c_0123456789abcdef"
         generated = {
             "url": "https://lh3.googleusercontent.com/image.png",
-            "cid": "conversation-1",
-            "rid": "response-1",
-            "rcid": "choice-1",
+            "cid": cid,
+            "rid": "r_fedcba9876543210",
+            "rcid": "rc_0123456789abcdef",
         }
         with mock.patch("gemini_web2api.server.generate_raw", return_value="raw") as generate, \
                 mock.patch("gemini_web2api.server.extract_generated_images", return_value=[generated]):
-            for session_id in ("batch-a", "batch-a", "batch-b"):
-                status, _, body = self.post_json(
-                    "/v1/images/generations",
-                    {"model": "gemini-3.6-flash", "prompt": "Generate the next frame", "session_id": session_id},
-                )
-                self.assertEqual(status, 200, body)
-                self.assertEqual(json.loads(body)["session_id"], session_id)
+            status, _, body = self.post_json(
+                "/v1/images/generations",
+                {"model": "gemini-3.6-flash", "prompt": "Generate the first frame"},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["session_id"], cid)
 
-        self.assertIsNone(generate.call_args_list[0].kwargs["chat_context"])
+            status, _, body = self.post_json(
+                "/v1/images/generations",
+                {"model": "gemini-3.6-flash", "prompt": "Generate the next frame",
+                 "session_id": cid},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["session_id"], cid)
+
+            status, _, body = self.post_json(
+                "/v1/images/generations",
+                {"model": "gemini-3.6-flash", "prompt": "Generate the next frame",
+                 "session_id": "c_fedcba9876543210"},
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(json.loads(body)["error"]["message"], "unknown or expired session_id")
+
+        self.assertIsNone(generate.call_args_list[0].kwargs.get("chat_context"))
         self.assertEqual(
             generate.call_args_list[1].kwargs["chat_context"],
-            {"cid": "conversation-1", "rid": "response-1", "rcid": "choice-1"},
+            {"cid": cid, "rid": "r_fedcba9876543210"},
         )
-        self.assertIsNone(generate.call_args_list[2].kwargs["chat_context"])
 
     def test_image_generation_rejects_invalid_session_ids(self):
-        status, _, body = self.post_json(
-            "/v1/images/generations",
-            {"model": "gemini-3.6-flash", "prompt": "Generate an image", "session_id": "bad/session"},
-        )
+        for session_id in ("bad/session", "batch-a", "c_tooshort"):
+            status, _, body = self.post_json(
+                "/v1/images/generations",
+                {"model": "gemini-3.6-flash", "prompt": "Generate an image",
+                 "session_id": session_id},
+            )
 
-        self.assertEqual(status, 400)
-        self.assertEqual(json.loads(body)["error"]["message"], "invalid session_id")
+            self.assertEqual(status, 400)
+            self.assertIn("invalid session_id", json.loads(body)["error"]["message"])
 
     @mock.patch("gemini_web2api.server.generate_stream")
     def test_chat_stream_starts_with_assistant_role(self, generate_stream):

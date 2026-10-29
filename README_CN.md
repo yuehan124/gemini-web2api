@@ -308,22 +308,34 @@ POST /v1/images/generations
 {
   "model": "gemini-3.6-flash",
   "prompt": "生成一张红苹果放在木桌上的图片",
-  "session_id": "video-job-42",
   "response_format": "url"
 }
 ```
 
-响应 (OpenAI 格式):
+首次生成不需要传 `session_id`，响应会返回 Gemini 网页端的会话 ID：
 
 ```json
 {
   "created": 1700000000,
-  "data": [{ "url": "https://lh3.googleusercontent.com/gg-dl/..." }]
+  "data": [{ "url": "https://lh3.googleusercontent.com/gg-dl/..." }],
+  "session_id": "c_5d0fb2ff1d694a5d"
+}
+```
+
+后续要继续同一组图片生成时，把上一步返回的 `session_id` 原样传回：
+
+```json
+{
+  "model": "gemini-3.6-flash",
+  "prompt": "保持构图不变，把苹果换成绿色",
+  "session_id": "c_5d0fb2ff1d694a5d",
+  "response_format": "url"
 }
 ```
 
 - `response_format` 支持 `url` (默认) 与 `b64_json`。
-- `session_id` 可选。连续生成一组图片时，每次请求使用同一个 ID，服务端会将 Gemini 上一轮会话接续到下一幅；不同生成批次使用不同 ID。相同 ID 的请求会串行处理。会话状态保存在当前服务进程内，闲置 1 小时或服务重启后失效；不传 ID 时保持原先的独立请求行为。
+- `session_id` 使用 Gemini 网页端会话 ID 格式 (`c_` + 16 位十六进制)，与网页 URL `/app/<cid>` 中的 ID 一致。服务端会把它和本轮 `rid` 一起作为会话 metadata 续接，行为与网页连续对话一致。
+- 不传 `session_id` 时创建新会话；传未知或已过期的 ID 返回 `404`，格式不合法返回 `400`。会话状态保存在当前服务进程内，闲置 1 小时或服务重启后失效。
 - Chat Completions / Responses 中如果 Gemini 出图, 回复文本末尾会自动附加
   `![image](...)` Markdown 链接。
 - 若该提示词触发的是"图片搜索"而非"图片生成", 响应会返回上游说明文本并以 HTTP 502 结束。
