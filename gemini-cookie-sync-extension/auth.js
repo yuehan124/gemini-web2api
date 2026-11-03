@@ -12,8 +12,6 @@ const EXPORT_ORDER = [
   "SSID",
   "APISID",
   "SAPISID",
-  "LSID",
-  "OSID",
   "SIDCC",
   "AEC",
   "NID",
@@ -27,10 +25,7 @@ const EXPORT_ORDER = [
   "__Secure-3PSID",
   "__Secure-3PSIDTS",
   "__Secure-3PSIDCC",
-  "__Secure-3PSIDRTS",
-  "__Secure-OSID",
-  "__Host-1PLSID",
-  "__Host-3PLSID"
+  "__Secure-3PSIDRTS"
 ];
 
 const LOOKUP_URLS = [
@@ -49,9 +44,9 @@ const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:8081",
   syncToken: "",
   autoSync: true,
-  // 5 分钟：Google 的轮转 token（PSIDTS 等）活跃时会快速失效，间隔过长会导致
+  // 1 分钟：Google 的轮转 token（PSIDTS 等）活跃时会快速失效，间隔过长会导致
   // 服务端持有陈旧会话，图像生成被上游拒绝。
-  intervalMinutes: 5
+  intervalMinutes: 1
 };
 
 const SYNC_PATH = "/v1/auth/sync";
@@ -145,12 +140,21 @@ async function readGoogleCookies() {
   return [...deduped.values()];
 }
 
+// gemini.google.com 只会收到 .google.com / .gemini.google.com 作用域的 cookie。
+// 若把 accounts.google.com、myaccount.google.com 的宿主级 cookie（OSID、
+// __Secure-OSID 等）也拍平进来，Gemini 会判定会话不一致：页面跳登录页，
+// StreamGenerate 返回 401。
+function inGeminiScope(cookie) {
+  const domain = normalizeDomain(cookie.domain);
+  return domain === "google.com" || domain === "gemini.google.com";
+}
+
 function selectBestCookies(cookies) {
   const selected = new Map();
 
   for (const name of EXPORT_ORDER) {
     const candidates = cookies
-      .filter((cookie) => cookie.name === name && cookie.value)
+      .filter((cookie) => cookie.name === name && cookie.value && inGeminiScope(cookie))
       .sort((a, b) => scoreCookie(b) - scoreCookie(a));
 
     if (candidates.length > 0) selected.set(name, candidates[0]);

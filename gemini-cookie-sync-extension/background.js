@@ -4,16 +4,19 @@
 importScripts("auth.js");
 
 const ALARM_NAME = "gemini-cookie-sync";
-const SETTINGS_VERSION = 1;
+const SETTINGS_VERSION = 2;
 
 async function migrateSettings() {
   const stored = await chrome.storage.local.get({ settingsVersion: 0, intervalMinutes: null });
   if (stored.settingsVersion >= SETTINGS_VERSION) return;
-  // 旧版本默认 25 分钟，且 worker 唤醒会重建 1 分钟延迟的 alarm；升级时统一回到 5 分钟。
-  await chrome.storage.local.set({
-    settingsVersion: SETTINGS_VERSION,
-    intervalMinutes: DEFAULT_SETTINGS.intervalMinutes
-  });
+
+  const patch = { settingsVersion: SETTINGS_VERSION };
+  // v0 的旧默认值不可信（曾为 25 分钟），直接迁到新默认；v1 的默认是 5 分钟，
+  // 仅在用户没有改过间隔时迁到 1 分钟，避免覆盖自定义设置。
+  if (stored.settingsVersion < 1 || stored.intervalMinutes == null || stored.intervalMinutes === 5) {
+    patch.intervalMinutes = DEFAULT_SETTINGS.intervalMinutes;
+  }
+  await chrome.storage.local.set(patch);
 }
 
 async function ensureAlarm() {

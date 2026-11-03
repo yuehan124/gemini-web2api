@@ -17,6 +17,12 @@ import time
 # At least one of these must be present for the session to be usable.
 SESSION_COOKIES = ("__Secure-1PSID", "__Secure-3PSID", "SID")
 
+# 扩展把各 Google 子域的 cookie 拍平成一条 Cookie 串，其中 accounts.google.com /
+# myaccount.google.com 的宿主级 cookie（OSID、__Secure-OSID 等）本不会发给
+# gemini.google.com。混入后 Gemini 会判定会话不一致：页面 302 跳登录页，
+# StreamGenerate 返回 401。落盘前剔除这些非 Gemini 作用域的名字。
+FOREIGN_HOST_COOKIES = ("LSID", "OSID", "__Secure-OSID", "__Host-1PLSID", "__Host-3PLSID")
+
 
 def parse_cookie(cookie):
     """Parse a Cookie header into a {name: value} dict (first wins)."""
@@ -46,6 +52,10 @@ def normalize_payload(raw):
     cookie = cookie.strip()
 
     cookies = parse_cookie(cookie)
+    if any(name in cookies for name in FOREIGN_HOST_COOKIES):
+        # 剔除后按 name=value 重新序列化，非 Gemini 作用域的宿主级 cookie 不再下发上游。
+        cookies = {name: value for name, value in cookies.items() if name not in FOREIGN_HOST_COOKIES}
+        cookie = "; ".join(f"{name}={value}" for name, value in cookies.items())
     if "SAPISID" not in cookies:
         return None, "cookie is missing SAPISID"
     if not any(name in cookies for name in SESSION_COOKIES):
