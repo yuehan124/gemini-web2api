@@ -26,6 +26,36 @@ import urllib.request
 
 IMAGE_URL_PREFIX = "https://lh3.googleusercontent.com/"
 IMAGE_REF_RE = re.compile(r"https?://googleusercontent\.com/image_generation_content/\d+_\d+")
+VIDEO_FILE_RE = re.compile(r"\.(?:mp4|m4v|webm|mov|avi|mkv)(?:[?#]|$)", re.I)
+
+# Used when Gemini answers an image prompt with a video.  The instruction is
+# appended only on retry so normal image prompts are sent to Gemini unchanged.
+IMAGE_ONLY_INSTRUCTION = (
+    "\n\n[Return one still image only. Do not generate a video, animation, "
+    "audio, or a link to any of them.]"
+)
+
+# Conservative video-intent detection used to reject prompts that can only
+# produce a video.  Prompts that also mention an image/still/frame/thumbnail
+# are left alone so "make a video thumbnail" still reaches the image path.
+VIDEO_REQUEST_RE = re.compile(
+    r"(?:生成|制作|创建|做|拍|来|给我)\s*(?:一|一个|一段|个)?\s*"
+    r"(?:视频|短片|动画|影片|动图)(?!游戏|封面|缩略图|帧|画面|图片|海报)"
+    r"|(?:generate|create|make|produce|render)\s+(?:me\s+)?(?:a|an|one|some)?\s*"
+    r"(?:video|animation|movie|clip|gif)\b"
+    r"(?!\s*(?:game|frame|thumbnail|poster|cover|image|picture|still))"
+    r"|(?:text|image)[- ]to[- ]video",
+    re.IGNORECASE,
+)
+IMAGE_REQUEST_RE = re.compile(
+    r"(?:图片|照片|图像|画面|静帧|海报|封面|缩略图|插画|插图|配图|绘图|制图|绘画|帧)"
+    r"|(?:image|photo|picture|still|poster|thumbnail|illustration|drawing|frame)",
+    re.IGNORECASE,
+)
+NEGATION_RE = re.compile(
+    r"(?:不要|别|无需|不需要|不用|禁止|\bno\b|\bdon't\b|\bdo not\b|\bwithout\b|\bnot\b)",
+    re.IGNORECASE,
+)
 
 _ssl_ctx = None
 
@@ -47,6 +77,7 @@ def _is_image_node(node) -> bool:
         and isinstance(node[2], str)
         and isinstance(node[3], str)
         and node[3].startswith(IMAGE_URL_PREFIX)
+        and not _is_video_node(node)
     )
 
 
@@ -76,6 +107,32 @@ def _first_dims(node):
     return None
 
 
+def _iter_response_inners(raw: str):
+    """Yield the decoded JSPB payload of every StreamGenerate chunk."""
+    for line in (raw or "").split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 200:
+            continue
+        try:
+            arr = json.loads(line)
+            inner = json.loads(arr[0][2])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            continue
+        if isinstance(inner, list):
+            yield inner
+
+
+def _conversation_ids(inner: list):
+    cid = rid = rcid = None
+    try:
+        if isinstance(inner[1], list) and len(inner[1]) >= 2:
+            cid, rid = inner[1][0], inner[1][1]
+        if isinstance(inner[4], list) and inner[4] and isinstance(inner[4][0], list):
+            rcid = inner[4][0][0] if inner[4][0] else None
+    except (IndexError, TypeError):
+        pass
+    return cid, rid, rcid
+
+
 def extract_generated_images(raw: str) -> list:
     """Parse a raw StreamGenerate response and return generated-image descriptors.
 
@@ -85,30 +142,13 @@ def extract_generated_images(raw: str) -> list:
     """
     images = []
     seen = set()
-    for line in (raw or "").split("\n"):
-        if '"wrb.fr"' not in line or len(line) < 200:
-            continue
-        try:
-            arr = json.loads(line)
-            inner = json.loads(arr[0][2])
-        except (json.JSONDecodeError, IndexError, TypeError):
-            continue
-        if not isinstance(inner, list):
-            continue
-
+    for inner in _iter_response_inners(raw):
         nodes = []
         _walk_images(inner, nodes)
         if not nodes:
             continue
 
-        cid = rid = rcid = None
-        try:
-            if isinstance(inner[1], list) and len(inner[1]) >= 2:
-                cid, rid = inner[1][0], inner[1][1]
-            if isinstance(inner[4], list) and inner[4] and isinstance(inner[4][0], list):
-                rcid = inner[4][0][0] if inner[4][0] else None
-        except (IndexError, TypeError):
-            pass
+        cid, rid, rcid = _conversation_ids(inner)
 
         for node in nodes:
             url = node[3]
@@ -129,6 +169,150 @@ def extract_generated_images(raw: str) -> list:
                 "rcid": rcid,
             })
     return images
+
+
+def _is_video_node(node) -> bool:
+    """Return True for a generated-video JSPB node.
+
+    Video nodes use the same shape as image nodes but carry a ``video/*`` mime
+    type and/or an ``.mp4``/``.webm`` filename.  Some Gemini builds also expose
+    video through a ``video_generation_content`` URL instead of a media node.
+    """
+    if not isinstance(node, list):
+        return False
+    if _first_str(node, "video/"):
+        return True
+    if len(node) < 4 or not isinstance(node[2], str) or not isinstance(node[3], str):
+        return False
+    if not node[3].startswith(("http://", "https://")):
+        return False
+    haystack = f"{node[2]} {node[3]}".lower()
+    return "video_generation_content" in haystack or bool(VIDEO_FILE_RE.search(haystack))
+
+
+def _walk_videos(node, out):
+    if isinstance(node, list):
+        if _is_video_node(node):
+            out.append(node)
+        for child in node:
+            _walk_videos(child, out)
+
+
+def _video_mime(node) -> str:
+    mime = _first_str(node, "video/")
+    if mime:
+        return mime
+    haystack = " ".join(v for v in node if isinstance(v, str)).lower()
+    if ".webm" in haystack:
+        return "video/webm"
+    if ".mov" in haystack:
+        return "video/quicktime"
+    if ".m4v" in haystack:
+        return "video/x-m4v"
+    return "video/mp4"
+
+
+def extract_generated_videos(raw: str) -> list:
+    """Return generated-video descriptors found in a StreamGenerate response."""
+    videos = []
+    seen = set()
+    for inner in _iter_response_inners(raw):
+        nodes = []
+        _walk_videos(inner, nodes)
+        if not nodes:
+            continue
+
+        cid, rid, rcid = _conversation_ids(inner)
+        for node in nodes:
+            url = node[3] if len(node) > 3 and isinstance(node[3], str) else None
+            key = url or f"node:{id(node)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            videos.append({
+                "url": url,
+                "filename": node[2] if len(node) > 2 and isinstance(node[2], str) else None,
+                "mime": _video_mime(node),
+                "cid": cid,
+                "rid": rid,
+                "rcid": rcid,
+            })
+
+    # Fallback for builds that only expose a video placeholder/link in the text.
+    raw_text = (raw or "").replace("\\/", "/")
+    for match in re.finditer(r'https?://[^\s"\'<>\\]+', raw_text):
+        url = match.group(0)
+        if "video_generation_content" not in url and not VIDEO_FILE_RE.search(url):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        videos.append({
+            "url": url,
+            "filename": None,
+            "mime": _video_mime([url]),
+            "cid": None,
+            "rid": None,
+            "rcid": None,
+        })
+    return videos
+
+
+def with_image_only_instruction(prompt: str) -> str:
+    """Append a still-image constraint used when Gemini returns a video."""
+    return (prompt or "").rstrip() + IMAGE_ONLY_INSTRUCTION
+
+
+def is_video_request(prompt: str) -> bool:
+    """Return True when the prompt is unambiguously asking for a video.
+
+    Used by the image endpoint to fail fast instead of letting Gemini generate
+    a video that the OpenAI Images response cannot represent.
+    """
+    prompt = prompt or ""
+    return (
+        bool(VIDEO_REQUEST_RE.search(prompt))
+        and not IMAGE_REQUEST_RE.search(prompt)
+        and not NEGATION_RE.search(prompt)
+    )
+
+
+def image_error(message: str, code: str, error_type: str = "invalid_request_error", **extra) -> dict:
+    """Build an OpenAI-compatible error object with a stable machine code."""
+    error = {"message": message, "type": error_type, "code": code}
+    error.update(extra)
+    return error
+
+
+def classify_image_failure(raw: str, text: str = None) -> dict:
+    """Describe why an image request produced no image.
+
+    The returned object is ready to be embedded under the top-level ``error``
+    key, so clients can show a specific message and branch on ``code``.
+    """
+    videos = extract_generated_videos(raw)
+    if videos:
+        mime = videos[0].get("mime") or "video/*"
+        error = image_error(
+            f"Gemini returned a video ({mime}) instead of an image. "
+            "This endpoint only generates still images; retry with a prompt "
+            "that explicitly asks for an image, or use a video-capable endpoint.",
+            "gemini_video_response",
+            "upstream_unsupported_media",
+            media_type=mime,
+        )
+        if text:
+            error["detail"] = text[:1000]
+        return error
+    if text:
+        return image_error(text, "gemini_text_response", "upstream_error")
+    return image_error(
+        "Gemini returned neither an image nor text. The prompt may have "
+        "triggered an unsupported output such as a video; retry with an "
+        "explicit still-image prompt.",
+        "gemini_empty_response",
+        "upstream_error",
+    )
 
 
 def apply_images_to_text(text: str, images: list) -> str:

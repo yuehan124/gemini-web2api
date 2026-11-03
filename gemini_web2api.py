@@ -915,14 +915,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_images(self, body: bytes):
         """OpenAI-compatible POST /v1/images/generations."""
+        from gemini_web2api.images import (
+            classify_image_failure,
+            conversation_context,
+            download_image,
+            extract_generated_images,
+            extract_generated_videos,
+            image_error,
+            is_video_request,
+            with_image_only_instruction,
+        )
+
         req, err = self._parse_json_body(body)
         if err:
-            self.send_json({"error": {"message": err}}, 400)
+            self.send_json({"error": image_error("invalid JSON", "invalid_json")}, 400)
             return
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
-            self.send_json({"error": {"message": err}}, 400)
+            self.send_json({"error": image_error(err, "invalid_model")}, 400)
             return
 
         session_id = req.get("session_id")
@@ -930,7 +941,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if session_id is not None:
             if not is_session_id(session_id):
                 self.send_json(
-                    {"error": {"message": "invalid session_id (expected Gemini conversation id like c_...)"}},
+                    {"error": image_error(
+                        "invalid session_id (expected Gemini conversation id like c_...)",
+                        "invalid_session_id",
+                    )},
                     400,
                 )
                 return
@@ -938,15 +952,47 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         prompt = req.get("prompt") or ""
         if not isinstance(prompt, str) or not prompt.strip():
-            self.send_json({"error": {"message": "empty prompt"}}, 400)
+            self.send_json({"error": image_error("empty prompt", "empty_prompt")}, 400)
+            return
+        if is_video_request(prompt):
+            self.send_json(
+                {"error": image_error(
+                    "The prompt asks for a video, but this endpoint only generates still images. "
+                    "Use a video-capable endpoint or ask for an image instead.",
+                    "video_not_supported",
+                )},
+                400,
+            )
             return
         response_format = req.get("response_format", "url")
 
-        from gemini_web2api.images import (
-            conversation_context,
-            download_image,
-            extract_generated_images,
-        )
+        def generate_once(prompt_text, chat_context=None):
+            return gemini_stream_generate(
+                prompt_text, model_id, think_mode, chat_context=chat_context,
+            )
+
+        def generate_with_image_retry(prompt_text, chat_context=None):
+            """Retry once with an explicit still-image instruction if Gemini
+            answers with a video instead of an image."""
+            raw = generate_once(prompt_text, chat_context)
+            images = extract_generated_images(raw)
+            if images:
+                return raw, images
+            videos = extract_generated_videos(raw)
+            if not videos:
+                return raw, images
+            log(
+                "Image generation returned video "
+                f"({videos[0].get('mime') or 'unknown'}); retrying with still-image instruction"
+            )
+            try:
+                retry_raw = generate_once(
+                    with_image_only_instruction(prompt_text), chat_context
+                )
+            except Exception as e:
+                log(f"Image retry after video failed: {e}")
+                return raw, images
+            return retry_raw, extract_generated_images(retry_raw)
 
         raw = None
         images = []
@@ -956,42 +1002,55 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     self._image_session_key(session_id), create=False
                 ) as session:
                     if session is None:
-                        self.send_json({"error": {"message": "unknown or expired session_id"}}, 404)
+                        self.send_json(
+                            {"error": image_error("unknown or expired session_id", "unknown_session")},
+                            404,
+                        )
                         return
                     if not session.get("context"):
                         self.send_json(
-                            {"error": {"message": "session context unavailable; start a new session"}},
+                            {"error": image_error(
+                                "session context unavailable; start a new session",
+                                "session_context_unavailable",
+                            )},
                             409,
                         )
                         return
-                    raw = gemini_stream_generate(
-                        prompt, model_id, think_mode,
-                        chat_context=session["context"],
-                    )
-                    images = extract_generated_images(raw)
+                    raw, images = generate_with_image_retry(prompt, session["context"])
                     if images:
                         context = conversation_context(images)
                         if not context:
                             self.send_json(
-                                {"error": {"message": "Gemini did not return conversation identifiers"}},
+                                {"error": image_error(
+                                    "Gemini did not return conversation identifiers",
+                                    "missing_conversation_id",
+                                    "upstream_error",
+                                )},
                                 502,
                             )
                             return
                         if context["cid"].lower() != session_id:
                             self.send_json(
-                                {"error": {"message": "Gemini started a new conversation; retry without session_id"}},
+                                {"error": image_error(
+                                    "Gemini started a new conversation; retry without session_id",
+                                    "conversation_changed",
+                                    "upstream_error",
+                                )},
                                 502,
                             )
                             return
                         session["context"] = context
             else:
-                raw = gemini_stream_generate(prompt, model_id, think_mode)
-                images = extract_generated_images(raw)
+                raw, images = generate_with_image_retry(prompt)
                 if images:
                     context = conversation_context(images)
                     if not context:
                         self.send_json(
-                            {"error": {"message": "Gemini did not return conversation identifiers"}},
+                            {"error": image_error(
+                                "Gemini did not return conversation identifiers",
+                                "missing_conversation_id",
+                                "upstream_error",
+                            )},
                             502,
                         )
                         return
@@ -999,12 +1058,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     with IMAGE_CONVERSATIONS.use(self._image_session_key(session_id)) as session:
                         session["context"] = context
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_json(
+                {"error": image_error(f"upstream error: {e}", "gemini_upstream_error", "upstream_error")},
+                502,
+            )
             return
 
         if not images:
-            detail = extract_response_text(raw) or "Gemini did not return an image for this prompt"
-            self.send_json({"error": {"message": detail}}, 502)
+            try:
+                detail = extract_response_text(raw)
+            except Exception as e:
+                detail = f"Gemini upstream rejected request: {e}"
+            error = classify_image_failure(raw, detail)
+            log(f"Image generation failed: code={error.get('code')} "
+                f"media_type={error.get('media_type') or '-'} "
+                f"text_len={len(detail or '')} raw_len={len(raw or '')}")
+            self.send_json({"error": error}, 502)
             return
 
         cookie_str, sapisid = load_cookie()

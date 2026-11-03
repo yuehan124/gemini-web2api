@@ -339,6 +339,23 @@ POST /v1/images/generations
 - Chat Completions / Responses 中如果 Gemini 出图, 回复文本末尾会自动附加
   `![image](...)` Markdown 链接。
 - 若该提示词触发的是"图片搜索"而非"图片生成", 响应会返回上游说明文本并以 HTTP 502 结束。
+- 明确要求生成视频/动画的 prompt 会直接返回 `400`, `error.code` 为 `video_not_supported`, 不会调用 Gemini。
+- 如果 Gemini 仍意外返回视频, 服务会自动追加"只返回一张静态图片"的约束重试一次; 重试后仍是视频则返回 `502`,
+  `error.code` 为 `gemini_video_response`, 并带 `media_type` (如 `video/mp4`)。
+- 其它图片生成失败也会返回稳定的错误码: `gemini_text_response` (上游只返回文本)、
+  `gemini_empty_response` (无图也无文本)、`gemini_upstream_error` (上游异常)。
+  错误对象同时包含 `type` 和 `code`, 便于客户端按类型处理, 例如:
+
+```json
+{
+  "error": {
+    "message": "Gemini returned a video (video/mp4) instead of an image. ...",
+    "type": "upstream_unsupported_media",
+    "code": "gemini_video_response",
+    "media_type": "video/mp4"
+  }
+}
+```
 
 > **注意**: 生成图片的 `lh3.googleusercontent.com/gg-dl/...` 链接受 Google 会话保护,
 > 服务端直接下载通常会返回 `403`。`b64_json` 模式下若下载失败会自动回退为返回 `url`;
